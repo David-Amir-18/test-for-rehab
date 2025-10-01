@@ -1,7 +1,7 @@
 import { motion, AnimatePresence } from "motion/react";
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { Send, Bot, User, AlertCircle } from "lucide-react";
+import { Send, Bot, User, AlertCircle, Upload, FileText, X } from "lucide-react";
 
 interface Question {
   id: string;
@@ -115,6 +115,13 @@ const questions: Question[] = [
   },
 ];
 
+// API Configuration for CSV upload
+const CSV_API_CONFIG = {
+  enabled: false, // Set to true when backend is ready
+  endpoint: "/api/upload-csv", // Backend API endpoint for CSV processing
+  timeout: 30000, // Request timeout in milliseconds
+};
+
 function ChatbotPage() {
   const navigate = useNavigate();
   const [messages, setMessages] = useState<Message[]>([]);
@@ -123,7 +130,10 @@ function ChatbotPage() {
   const [userInput, setUserInput] = useState("");
   const [parameters, setParameters] = useState<Record<string, number>>({});
   const [isComplete, setIsComplete] = useState(false);
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -238,6 +248,185 @@ function ChatbotPage() {
     return { valid: true };
   };
 
+  /**
+   * Parse CSV file and convert to JSON
+   */
+  const parseCSV = (csvText: string): Record<string, number> | null => {
+    try {
+      const lines = csvText.trim().split('\n');
+      if (lines.length < 2) {
+        throw new Error("CSV file must have at least a header row and one data row");
+      }
+
+      // Parse header
+      const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+
+      // Parse first data row
+      const values = lines[1].split(',').map(v => v.trim());
+
+      const data: Record<string, number> = {};
+
+      // Map CSV columns to API keys
+      const csvToApiKeyMap: Record<string, string> = {
+        'orbital_period': 'orbper',
+        'orbper': 'orbper',
+        'transit_depth': 'trandep',
+        'trandep': 'trandep',
+        'transit_duration': 'trandur',
+        'trandur': 'trandur',
+        'planet_radius': 'rade',
+        'rade': 'rade',
+        'insolation_flux': 'insol',
+        'insol': 'insol',
+        'equilibrium_temp': 'eqt',
+        'eqt': 'eqt',
+        'stellar_temp': 'teff',
+        'teff': 'teff',
+        'stellar_logg': 'logg',
+        'logg': 'logg',
+        'stellar_radius': 'rad',
+        'rad': 'rad',
+      };
+
+      headers.forEach((header, index) => {
+        const apiKey = csvToApiKeyMap[header];
+        if (apiKey && values[index]) {
+          const numValue = parseFloat(values[index]);
+          if (!isNaN(numValue)) {
+            data[apiKey] = numValue;
+          }
+        }
+      });
+
+      // Validate that we have all required parameters
+      const requiredKeys = questions.map(q => q.apiKey);
+      const missingKeys = requiredKeys.filter(key => !(key in data));
+
+      if (missingKeys.length > 0) {
+        throw new Error(`Missing required parameters: ${missingKeys.join(', ')}`);
+      }
+
+      return data;
+    } catch (error) {
+      console.error("CSV parsing error:", error);
+      return null;
+    }
+  };
+
+  /**
+   * Handle CSV file upload
+   */
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.name.endsWith('.csv')) {
+      addMessage("⚠️ Please upload a CSV file", "bot", 0, true);
+      return;
+    }
+
+    setUploadedFile(file);
+    setIsUploading(true);
+    addMessage(`📄 Uploaded: ${file.name}`, "user");
+
+    try {
+      const text = await file.text();
+      const parsedData = parseCSV(text);
+
+      if (!parsedData) {
+        addMessage(
+          "⚠️ Failed to parse CSV. Please ensure it has the correct format with all required parameters.",
+          "bot",
+          500,
+          true
+        );
+        setIsUploading(false);
+        setUploadedFile(null);
+        return;
+      }
+
+      // If API is enabled, send to backend
+      if (CSV_API_CONFIG.enabled) {
+        await sendCSVToBackend(parsedData);
+      } else {
+        // Store parameters and proceed
+        setParameters(parsedData);
+        setIsComplete(true);
+
+        setTimeout(() => {
+          addMessage(
+            "✅ CSV data loaded successfully! Initiating Zeto deep space analysis...",
+            "bot"
+          );
+        }, 500);
+
+        setTimeout(() => {
+          navigate("/analysis", { state: { parameters: parsedData } });
+        }, 2500);
+      }
+    } catch (error) {
+      addMessage(
+        `⚠️ Error reading file: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        "bot",
+        500,
+        true
+      );
+      setUploadedFile(null);
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  /**
+   * Send CSV data to backend API
+   */
+  const sendCSVToBackend = async (data: Record<string, number>) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CSV_API_CONFIG.timeout);
+
+    try {
+      const response = await fetch(CSV_API_CONFIG.endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(data),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status} ${response.statusText}`);
+      }
+
+      const result = await response.json();
+
+      addMessage("✅ Data sent to backend successfully!", "bot", 500);
+
+      // Navigate with backend response
+      setTimeout(() => {
+        navigate("/analysis", { state: { parameters: data, backendResult: result } });
+      }, 2000);
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new Error("Request timed out");
+      }
+      throw error;
+    }
+  };
+
+  /**
+   * Clear uploaded file
+   */
+  const handleClearFile = () => {
+    setUploadedFile(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+    addMessage("📄 File removed", "bot");
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!userInput.trim()) return;
@@ -280,7 +469,9 @@ function ChatbotPage() {
       }, 500);
 
       // Just update the state - the useEffect will handle asking the next question
-      setCurrentQuestion((prev) => prev + 1);
+      setTimeout(() => {
+        setCurrentQuestion((prev) => prev + 1);
+      }, 500);
     } else {
       setIsComplete(true);
       setTimeout(() => {
@@ -429,6 +620,51 @@ function ChatbotPage() {
           animate={{ y: 0, opacity: 1 }}
           transition={{ delay: 0.5 }}
         >
+          {/* CSV Upload Section */}
+          <div className="mb-4 flex items-center gap-3">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv"
+              onChange={handleFileUpload}
+              className="hidden"
+              id="csv-upload"
+            />
+            <label
+              htmlFor="csv-upload"
+              className="flex items-center gap-2 bg-gradient-to-r from-purple-500 to-pink-600 hover:from-purple-600 hover:to-pink-700 px-4 py-2 rounded-lg cursor-pointer transition-all duration-200"
+            >
+              <Upload className="w-4 h-4 text-white" />
+              <span className="text-white text-sm font-medium">Upload CSV</span>
+            </label>
+
+            {uploadedFile && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.8 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="flex items-center gap-2 bg-gray-800/80 border border-cyan-500/30 rounded-lg px-3 py-2"
+              >
+                <FileText className="w-4 h-4 text-cyan-400" />
+                <span className="text-sm text-gray-300">{uploadedFile.name}</span>
+                <button
+                  type="button"
+                  onClick={handleClearFile}
+                  className="ml-2 hover:bg-red-500/20 p-1 rounded transition-colors"
+                >
+                  <X className="w-4 h-4 text-red-400" />
+                </button>
+              </motion.div>
+            )}
+
+            {isUploading && (
+              <motion.div
+                animate={{ rotate: 360 }}
+                transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+                className="w-5 h-5 border-2 border-cyan-400 border-t-transparent rounded-full"
+              />
+            )}
+          </div>
+
           <div className="flex gap-3">
             <input
               type={questions[currentQuestion]?.type || "text"}
